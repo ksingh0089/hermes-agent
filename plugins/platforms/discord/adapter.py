@@ -1061,6 +1061,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
         # Threads the bot participated in (no @mention needed there); persisted across restarts.
         self._threads = ThreadParticipationTracker("discord")
+        # Threads this bot created. In owner-routing mode, merely answering an explicit
+        # handoff in another bot's thread must not claim its later ambient follow-ups.
+        self._owned_threads = ThreadParticipationTracker("discord_owned")
         # Persistent typing loops per channel (DMs don't reliably show bot typing events).
         self._typing_tasks: Dict[str, asyncio.Task] = {}
         self._bot_task: Optional[asyncio.Task] = None
@@ -2273,9 +2276,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
     def _in_bot_thread(self, message: Any) -> bool:
         """Thread the bot already joined skips the mention check — unless
         thread_require_mention (multi-bot threads) gates threads like channels."""
+        tracker = self._owned_threads if self._discord_thread_owner_routing() else self._threads
         return (
             isinstance(message.channel, discord.Thread)
-            and str(message.channel.id) in self._threads
+            and str(message.channel.id) in tracker
             and not self._discord_thread_require_mention()
         )
 
@@ -3070,6 +3074,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             logger.error("[%s] Failed to create forum thread in %s: %s", self.name, forum_channel.id, e)
             return SendResult(success=False, error=f"Forum thread creation failed: {e}")
         thread_channel, thread_id, starter_msg, message_id = self._forum_thread_parts(thread)
+        if thread_id:
+            self._threads.mark(thread_id)
+            self._owned_threads.mark(thread_id)
         message_ids = [message_id]
         warnings: list[str] = []
         for chunk in chunks[1:]:
@@ -3114,6 +3121,9 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             )
             return SendResult(success=False, error=f"Forum thread creation failed: {e}")
         thread_channel, thread_id, starter_msg, message_id = self._forum_thread_parts(thread)
+        if thread_id:
+            self._threads.mark(thread_id)
+            self._owned_threads.mark(thread_id)
         if file is not None or files:
             attachments = getattr(starter_msg, "attachments", None) or []
             if not attachments:
@@ -4677,6 +4687,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Track thread participation so follow-ups don't require @mention
         if thread_id:
             self._threads.mark(thread_id)
+            self._owned_threads.mark(thread_id)
         starter = (message or "").strip()
         if starter and thread_id:
             await self._dispatch_thread_session(interaction, thread_id, thread_name, starter)
@@ -4934,20 +4945,53 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         content = getattr(message, "content", "") or ""
         return {match.group(1) for match in re.finditer(r"<@!?(\d+)>", content)}
 
+    def _raw_mentioned_role_ids(self, message: Any) -> set:
+        """Extract role-mention IDs from raw content, including unhydrated events."""
+        content = getattr(message, "content", "") or ""
+        return {match.group(1) for match in re.finditer(r"<@&(\d+)>", content)}
+
+    def _self_role_ids(self, message: Any) -> set[str]:
+        """Return role IDs held by this bot in the message guild."""
+        if not self._client or not self._client.user:
+            return set()
+        guild = getattr(message, "guild", None) or getattr(
+            getattr(message, "channel", None), "guild", None
+        )
+        get_member = getattr(guild, "get_member", None) if guild is not None else None
+        try:
+            member = get_member(self._client.user.id) if callable(get_member) else None
+        except Exception:
+            member = None
+        member = member or getattr(guild, "me", None)
+        return {
+            str(role.id)
+            for role in (getattr(member, "roles", None) or [])
+            if getattr(role, "id", None) is not None
+        }
+
     def _self_is_explicitly_mentioned(self, message: Any) -> bool:
-        """True when the bot is in ``message.mentions`` or raw-mentioned in the content."""
+        """True when the bot or one of its roles is explicitly mentioned."""
         if not self._client or not self._client.user:
             return False
         if self._client.user in getattr(message, "mentions", []):
             return True
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        resolved_roles = {
+            str(role.id)
+            for role in (getattr(message, "role_mentions", None) or [])
+            if getattr(role, "id", None) is not None
+        }
+        return bool(self._self_role_ids(message) & (resolved_roles | self._raw_mentioned_role_ids(message)))
 
     def _self_is_raw_mentioned(self, message: Any) -> bool:
-        """True only for a literal ``<@bot>`` token: reply-pings add us to ``message.mentions``
-        without one, and the bot admission gate must tell those apart."""
+        """True only for a literal bot user/role token: reply-pings add us to
+        ``message.mentions`` without one, and the bot admission gate must tell those apart."""
         if not self._client or not self._client.user:
             return False
-        return str(self._client.user.id) in self._raw_mentioned_user_ids(message)
+        if str(self._client.user.id) in self._raw_mentioned_user_ids(message):
+            return True
+        return bool(self._self_role_ids(message) & self._raw_mentioned_role_ids(message))
 
     def _discord_bots_require_inline_mention(self) -> bool:
         """Whether another bot must type an inline @mention to trigger us.
@@ -5003,6 +5047,12 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         """Whether threads still require @mention after the bot has participated (default False).
         Set True when multiple bots share a thread to avoid bot-to-bot loops."""
         return self._extra_or_env_flag("thread_require_mention", "DISCORD_THREAD_REQUIRE_MENTION", "false", truthy=True)
+
+    def _discord_thread_owner_routing(self) -> bool:
+        """Whether ambient thread replies are limited to bot-created threads."""
+        return self._extra_or_env_flag(
+            "thread_owner_routing", "DISCORD_THREAD_OWNER_ROUTING", "false", truthy=True
+        )
 
     def _discord_history_backfill(self) -> bool:
         """Return whether history backfill is enabled for shared sessions."""
@@ -5389,7 +5439,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             create = getattr(parent, "create_thread", None)
             if create is not None:
                 thread = await create(name=thread_name, auto_archive_duration=1440, reason=reason)
-                return str(thread.id)
+                thread_id = str(thread.id)
+                self._threads.mark(thread_id)
+                self._owned_threads.mark(thread_id)
+                return thread_id
         except Exception as direct_error:
             logger.debug(
                 "[%s] Handoff thread: direct create failed (%s); trying seed-message fallback",
@@ -5403,7 +5456,10 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             thread = await seed_msg.create_thread(
                 name=thread_name, auto_archive_duration=1440, reason=reason,
             )
-            return str(thread.id)
+            thread_id = str(thread.id)
+            self._threads.mark(thread_id)
+            self._owned_threads.mark(thread_id)
+            return thread_id
         except Exception as fallback_error:
             logger.warning(
                 "[%s] Handoff thread: both create paths failed for parent %s: %s",
@@ -5917,6 +5973,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
             if self._client.user:
                 normalized_content = normalized_content.replace(f"<@{self._client.user.id}>", "").strip()
                 normalized_content = normalized_content.replace(f"<@!{self._client.user.id}>", "").strip()
+            for role_id in self._self_role_ids(message):
+                normalized_content = normalized_content.replace(f"<@&{role_id}>", "").strip()
             message.content = normalized_content
         if not isinstance(message.channel, discord.DMChannel):
             channel_ids = {str(message.channel.id)}
@@ -5969,6 +6027,7 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                     thread_id = str(thread.id)
                     auto_threaded_channel = thread
                     self._threads.mark(thread_id)
+                    self._owned_threads.mark(thread_id)
                     # Pre-seed dedup: message.create_thread() fires a second MESSAGE_CREATE for the
                     # starter (id == thread.id, maybe type=default); mark it so it can't trigger a rerun.
                     self._dedup.is_duplicate(str(thread.id))
@@ -6064,13 +6123,17 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         if (not event_text or not event_text.strip()) and not _channel_context:
             # Bare mention-only ping with no media/text/backfill: drop rather than spawn an empty turn.
             if (mention_prefix and not media_urls and not pending_text_injection):
-                logger.info(
-                    "[%s] Ignoring mention-only message from %s in %s", self.name,
-                    getattr(message.author, "display_name", getattr(message.author, "name", "unknown")),
-                    getattr(message.channel, "id", "unknown"),
-                )
-                return False
-            event_text = "(The user sent a message with no text content)"
+                if is_thread and not in_bot_thread:
+                    event_text = "(The user explicitly mentioned you to join this thread)"
+                else:
+                    logger.info(
+                        "[%s] Ignoring mention-only message from %s in %s", self.name,
+                        getattr(message.author, "display_name", getattr(message.author, "name", "unknown")),
+                        getattr(message.channel, "id", "unknown"),
+                    )
+                    return False
+            if not event_text:
+                event_text = "(The user sent a message with no text content)"
         _chan = message.channel
         _parent_id = str(getattr(_chan, "parent_id", "") or "")
         _chan_id = str(getattr(_chan, "id", ""))
@@ -7176,6 +7239,7 @@ def interactive_setup() -> None:
 _YAML_BOOL_ENV_KEYS = (
     ("require_mention", "DISCORD_REQUIRE_MENTION"),
     ("thread_require_mention", "DISCORD_THREAD_REQUIRE_MENTION"),
+    ("thread_owner_routing", "DISCORD_THREAD_OWNER_ROUTING"),
     ("bots_require_inline_mention", "DISCORD_BOTS_REQUIRE_INLINE_MENTION"),
 )
 # (public websocket_* key, legacy liveness_* alias, env bridge var)

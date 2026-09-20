@@ -360,6 +360,7 @@ The `discord` section in `~/.hermes/config.yaml` mirrors the env vars above. Con
 discord:
   require_mention: true           # Require @mention in server channels
   thread_require_mention: false   # If true, require @mention in threads too (multi-bot threads)
+  thread_owner_routing: false     # If true, only bot-created threads get ambient follow-ups
   bots_require_inline_mention: true  # Bot authors must type a literal @mention (default: true)
   free_response_channels: ""      # Comma-separated channel IDs (or YAML list)
   auto_thread: true               # Auto-create threads on @mention
@@ -408,6 +409,16 @@ discord:
   require_mention: true
   thread_require_mention: true    # multi-bot setup
 ```
+
+#### `discord.thread_owner_routing`
+
+**Type:** boolean — **Default:** `false`
+
+When enabled, mention-free follow-ups are limited to threads created by this bot. An explicit
+user or bot-role mention can hand one turn to another Hermes profile without letting that profile
+claim later ambient messages in the thread. For controlled multi-profile handoffs, keep
+`thread_require_mention: false`, set `bots_require_inline_mention: true`, and use
+`DISCORD_ALLOW_BOTS="mentions"`.
 
 #### `discord.free_response_channels`
 

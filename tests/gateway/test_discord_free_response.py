@@ -111,6 +111,7 @@ def adapter(monkeypatch):
     for _var in (
         "DISCORD_REQUIRE_MENTION",
         "DISCORD_THREAD_REQUIRE_MENTION",
+        "DISCORD_THREAD_OWNER_ROUTING",
         "DISCORD_FREE_RESPONSE_CHANNELS",
         "DISCORD_FREE_RESPONSE_AUTO_THREAD",
         "DISCORD_AUTO_THREAD",
@@ -131,12 +132,15 @@ def adapter(monkeypatch):
     return adapter
 
 
-def make_message(*, channel, content: str, mentions=None, msg_type=None):
-    author = SimpleNamespace(id=42, display_name="Jezza", name="Jezza")
+def make_message(
+    *, channel, content: str, mentions=None, role_mentions=None, msg_type=None, author=None,
+):
+    author = author or SimpleNamespace(id=42, display_name="Jezza", name="Jezza", bot=False)
     return SimpleNamespace(
         id=123,
         content=content,
         mentions=list(mentions or []),
+        role_mentions=list(role_mentions or []),
         attachments=[],
         reference=None,
         created_at=datetime.now(timezone.utc),
@@ -1002,6 +1006,82 @@ async def test_discord_reply_in_free_channel_triggers_backfill(adapter, monkeypa
     assert event.channel_context == (
         "[Context around the replied-to message]\n[Hermes [bot]] earlier answer"
     )
+
+
+@pytest.mark.asyncio
+async def test_thread_owner_routing_ignores_foreign_thread_followups(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["thread_owner_routing"] = True
+    thread = FakeThread(channel_id=456, name="foreign thread")
+    adapter._threads.mark("456")
+
+    assert await adapter._handle_message(make_message(channel=thread, content="ambient")) is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_thread_owner_routing_allows_owned_thread_followups(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["thread_owner_routing"] = True
+    thread = FakeThread(channel_id=456, name="owned thread")
+    adapter._threads.mark("456")
+    adapter._owned_threads.mark("456")
+
+    assert await adapter._handle_message(make_message(channel=thread, content="follow-up")) is True
+    adapter.handle_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_thread_owner_routing_applies_to_recovered_messages(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    adapter.config.extra["thread_owner_routing"] = True
+    thread = FakeThread(channel_id=456, name="foreign thread")
+    adapter._threads.mark("456")
+
+    assert await adapter._dispatch_recovered_message(
+        make_message(channel=thread, content="missed ambient message")
+    ) is False
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_bot_role_mention_joins_foreign_thread_even_when_empty(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_REQUIRE_MENTION", "true")
+    monkeypatch.setenv("DISCORD_AUTO_THREAD", "false")
+    adapter.config.extra["thread_owner_routing"] = True
+    role_id = 1522315013522718795
+    bot_member = SimpleNamespace(id=999, roles=[SimpleNamespace(id=role_id)])
+    guild = SimpleNamespace(id=777, name="Hermes Server", get_member=lambda uid: bot_member if uid == 999 else None)
+    thread = FakeThread(channel_id=456, name="foreign thread")
+    thread.guild = guild
+    message = make_message(channel=thread, content=f"<@&{role_id}>")
+    message.guild = guild
+
+    assert await adapter._handle_message(message) is True
+    event = adapter.handle_message.await_args.args[0]
+    assert event.text == "(The user explicitly mentioned you to join this thread)"
+    assert "456" not in adapter._owned_threads
+
+
+
+def test_bot_role_token_satisfies_inline_bot_admission(adapter, monkeypatch):
+    monkeypatch.setenv("DISCORD_ALLOW_BOTS", "mentions")
+    adapter.config.extra["bots_require_inline_mention"] = True
+    role_id = 1522315013522718795
+    bot_member = SimpleNamespace(id=999, roles=[SimpleNamespace(id=role_id)])
+    guild = SimpleNamespace(id=777, name="Hermes Server", get_member=lambda uid: bot_member if uid == 999 else None)
+    thread = FakeThread(channel_id=456, name="foreign thread")
+    thread.guild = guild
+    other_bot = SimpleNamespace(id=1234, display_name="Helios", name="Helios", bot=True)
+    message = make_message(
+        channel=thread, content=f"<@&{role_id}> review this", author=other_bot,
+    )
+    message.guild = guild
+
+    admitted, _ = adapter._discord_message_admission(message, claim=False)
+    assert admitted is True
 
 
 class TestNonConversationalTrackerOffload:
